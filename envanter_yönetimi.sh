@@ -1,453 +1,790 @@
 #!/bin/bash
-
-# Strict mode
-set -euo pipefail
-IFS=$'\n\t'
-
-# Sabit değişkenler
-readonly DEPO_CSV="depo.csv"
-readonly KULLANICI_CSV="kullanici.csv"
-readonly LOG_CSV="log.csv"
-readonly YEDEK_DIZINI="yedekler"
-readonly KATEGORI_CSV="kategori.csv"
-readonly MAX_LOGIN_ATTEMPTS=3
-readonly STOK_ESIK=10
-readonly YUKSEK_STOK_ESIK=100
-
-# Genel değişkenler
-declare CURRENT_USER=""
-declare CURRENT_ROLE=""
-
-# Yardımcı fonksiyonlar
-cleanup() {
-    local exit_code=$?
-    if [ $exit_code -ne 0 ]; then
-        log_kayit "9999" "${CURRENT_USER:-anonim}" "Program beklenmedik şekilde sonlandı (Kod: $exit_code)"
-    fi
-    exit $exit_code
+# Gerekli dosyaların kontrolü ve ilk ayarlar
+# Gerekli dosyaların kontrolü ve ilk ayarlar
+check_files() {
+    local files=("depo.csv" "kullanici.csv" "log.csv")
+    for file in "${files[@]}"; do
+        if [ ! -f "$file" ]; then
+            touch "$file"
+            if [ "$file" == "kullanici.csv" ]; then
+                # Admin kullanıcısını ekle (username, ad soyad, rol, parola, kilitli_mi, başarısız_giriş)
+                echo "admin,Admin Admin,yonetici,$(echo -n "admin123" | md5sum | cut -d' ' -f1),0,0" > "$file"
+            fi
+        fi
+    done
+    chmod 644 *.csv
 }
 
-trap cleanup EXIT
-trap 'exit 1' INT TERM
 
-# Dosya kilitleme
-lock_file() {
-    local lockfile=$1.lock
-    if ! mkdir "$lockfile" 2>/dev/null; then
-        echo "Dosya kilidi alınamadı: $1" >&2
-        return 1
-    fi
+# Hata kaydı oluşturma
+log_error() {
+    local error_no=$1
+    local error_msg=$2
+    local user=$3
+    local product=$4
+    echo "$(date '+%Y-%m-%d %H:%M:%S'),$error_no,$user,$error_msg,$product" >> log.csv
 }
 
-unlock_file() {
-    local lockfile=$1.lock
-    rmdir "$lockfile" 2>/dev/null || true
-}
-
-# Progress bar gösterimi
+# İlerleme çubuğu gösterimi
 show_progress() {
     local message=$1
     (
-    echo "10"; sleep 0.5
-    echo "30"; sleep 0.5
-    echo "50"; sleep 0.5
-    echo "70"; sleep 0.5
-    echo "100"; sleep 0.5
+        echo "0"
+        sleep 0.5
+        echo "25"
+        sleep 0.5
+        echo "50"
+        sleep 0.5
+        echo "75"
+        sleep 0.5
+        echo "100"
     ) | zenity --progress \
-        --title="İşlem Sürüyor" \
+        --title="İşlem Durumu" \
         --text="$message" \
         --percentage=0 \
         --auto-close \
         --width=300
 }
 
-# Dosya kontrolü
-dosya_kontrol() {
-    local default_files=(
-        "$DEPO_CSV:600"
-        "$KULLANICI_CSV:600"
-        "$LOG_CSV:600"
-        "$KATEGORI_CSV:600"
-    )
-
-    for file_info in "${default_files[@]}"; do
-        local file="${file_info%%:*}"
-        local perms="${file_info##*:}"
-        
-        if [ ! -f "$file" ]; then
-            touch "$file"
-            chmod "$perms" "$file"
-            
-            case "$file" in
-                "$KULLANICI_CSV")
-                    echo "1,admin,admin,yonetici,$(echo -n "admin" | md5sum | cut -d' ' -f1),0" > "$file"
-                    ;;
-                "$KATEGORI_CSV")
-                    {
-                        echo "1,Elektronik"
-                        echo "2,Gıda"
-                        echo "3,Kırtasiye"
-                        echo "4,Ev Eşyaları"
-                        echo "5,Giysi"
-                    } > "$file"
-                    ;;
-                "$DEPO_CSV")
-                    echo "UrunNo,UrunAdi,StokMiktari,BirimFiyat,Kategori" > "$file"
-                    ;;
-            esac
-        fi
-    done
-
-    mkdir -p "$YEDEK_DIZINI"
-    chmod 700 "$YEDEK_DIZINI"
-}
-
-# Log kaydı
-log_kayit() {
-    local hata_no=$1
-    local kullanici=$2
-    local mesaj=$3
-    local zaman=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    lock_file "$LOG_CSV"
-    printf "%s,%s,%s,%s\n" "$hata_no" "$zaman" "$kullanici" "$mesaj" >> "$LOG_CSV"
-    unlock_file "$LOG_CSV"
-}
-
 # Kullanıcı girişi
-giris_kontrol() {
-    local username password md5_pass user_info
-
-    username=$(zenity --entry \
-        --title="Giriş" \
-        --text="Kullanıcı Adı:" \
+login() {
+    local credentials
+    credentials=$(zenity --forms --title="Giriş" \
+        --text="Kullanıcı Girişi" \
+        --add-entry="Kullanıcı Adı" \
+        --add-password="Parola" \
         --width=300)
-    
-    if [ -z "$username" ]; then exit 0; fi
 
-    password=$(zenity --password \
-        --title="Giriş" \
-        --text="Şifre:" \
-        --width=300)
-    
-    if [ -z "$password" ]; then exit 0; fi
-
-    if [[ "$username" =~ [,\'\"] || "$password" =~ [,\'\"] ]]; then
-        zenity --error \
-            --text="Geçersiz karakterler içeriyor!" \
-            --width=300
-        return 1
+    if [ -z "$credentials" ]; then
+        exit 0
     fi
 
-    md5_pass=$(echo -n "$password" | md5sum | cut -d' ' -f1)
-    
-    lock_file "$KULLANICI_CSV"
-    user_info=$(grep "^[^,]*,$username," "$KULLANICI_CSV")
-    
+    local username=$(echo "$credentials" | cut -d'|' -f1)
+    local password=$(echo "$credentials" | cut -d'|' -f2)
+    local md5pass=$(echo -n "$password" | md5sum | cut -d' ' -f1)
+
+    # Kullanıcı bilgilerini al
+    local user_info
+    user_info=$(grep "^$username," kullanici.csv)
+
     if [ -n "$user_info" ]; then
-        local id user_name user_surname role stored_pass attempts
-        IFS=',' read -r id user_name user_surname role stored_pass attempts <<< "$user_info"
-        
-        if [ "$attempts" -ge $MAX_LOGIN_ATTEMPTS ]; then
-            unlock_file "$KULLANICI_CSV"
-            zenity --error \
-                --text="Hesabınız kilitlenmiştir. Yönetici ile iletişime geçin." \
-                --width=300
-            log_kayit "1001" "$username" "Kilitli hesaba giriş denemesi"
+        local stored_pass=$(echo "$user_info" | cut -d',' -f4)
+        local role=$(echo "$user_info" | cut -d',' -f3)
+        local locked=$(echo "$user_info" | cut -d',' -f5)
+        local failed_attempts=$(echo "$user_info" | cut -d',' -f6)
+
+        if [ "$locked" -eq 1 ]; then
+            zenity --error --text="Hesabınız kilitlenmiştir. Yönetici ile iletişime geçiniz." --width=300
+            log_error "1002" "Kilitli hesaba giriş denemesi" "$username" "-"
             return 1
         fi
 
-        if [ "$stored_pass" == "$md5_pass" ]; then
-            sed -i "s/^$id,$username,$user_surname,$role,$stored_pass,[0-9]*/$id,$username,$user_surname,$role,$stored_pass,0/" "$KULLANICI_CSV"
-            unlock_file "$KULLANICI_CSV"
+        if [ "$md5pass" = "$stored_pass" ]; then
+            # Başarılı giriş, başarısız giriş sayısını sıfırla
+            sed -i "/^$username,/c\\$username,$(echo "$user_info" | cut -d',' -f2),$role,$stored_pass,0,0" kullanici.csv
             export CURRENT_USER="$username"
-            export CURRENT_ROLE="$role"
+            export USER_ROLE="$role"
             return 0
         else
-            local new_attempts=$((attempts + 1))
-            sed -i "s/^$id,$username,$user_surname,$role,$stored_pass,[0-9]*/$id,$username,$user_surname,$role,$stored_pass,$new_attempts/" "$KULLANICI_CSV"
-            unlock_file "$KULLANICI_CSV"
-            
-            if [ "$new_attempts" -ge $MAX_LOGIN_ATTEMPTS ]; then
-                zenity --error \
-                    --text="Hesabınız kilitlenmiştir. Yönetici ile iletişime geçin." \
-                    --width=300
-                log_kayit "1002" "$username" "Hesap kilitlendi"
+            # Başarısız giriş, sayıyı artır
+            local new_failed=$((failed_attempts + 1))
+            if [ "$new_failed" -ge 3 ]; then
+                # Hesabı kilitle
+                sed -i "/^$username,/c\\$username,$(echo "$user_info" | cut -d',' -f2),$role,$stored_pass,1,0" kullanici.csv
+                zenity --error --text="3 kez hatalı giriş yapıldı. Hesabınız kilitlendi." --width=300
+                log_error "1003" "Hesap kilitlenmesi" "$username" "-"
             else
-                zenity --warning \
-                    --text="Hatalı şifre! Kalan deneme hakkı: $((MAX_LOGIN_ATTEMPTS-new_attempts))" \
-                    --width=300
-                log_kayit "1003" "$username" "Hatalı şifre denemesi"
+                # Başarısız giriş sayısını güncelle
+                sed -i "/^$username,/c\\$username,$(echo "$user_info" | cut -d',' -f2),$role,$stored_pass,$locked,$new_failed" kullanici.csv
+                zenity --error --text="Hatalı kullanıcı adı veya parola!" --width=200
+                log_error "1001" "Hatalı giriş denemesi" "$username" "-"
             fi
             return 1
         fi
     else
-        unlock_file "$KULLANICI_CSV"
-        zenity --error \
-            --text="Kullanıcı bulunamadı!" \
-            --width=300
-        log_kayit "1004" "$username" "Kullanıcı bulunamadı"
+        zenity --error --text="Hatalı kullanıcı adı veya parola!" --width=200
+        log_error "1001" "Hatalı giriş denemesi" "$username" "-"
         return 1
     fi
 }
 
-# Yetki kontrolü
-yetki_kontrol() {
-    if [ "$CURRENT_ROLE" != "yonetici" ]; then
-        zenity --error \
-            --text="Bu işlem için yetkiniz bulunmamaktadır!" \
-            --width=300
-        return 1
+# Yeni ürün numarası oluşturma
+get_new_product_id() {
+    if [ ! -s depo.csv ]; then
+        echo "1"
+        return
     fi
-    return 0
+    local last_id=$(tail -n 1 depo.csv | cut -d',' -f1)
+    echo $((last_id + 1))
 }
 
 # Ürün ekleme
-urun_ekle() {
-    if ! yetki_kontrol; then return 1; fi
-
-    local form_data
-    form_data=$(zenity --forms \
-        --title="Ürün Ekle" \
+add_product() {
+    local product_info
+    product_info=$(zenity --forms --title="Ürün Ekle" \
         --text="Ürün Bilgileri" \
         --add-entry="Ürün Adı" \
         --add-entry="Stok Miktarı" \
         --add-entry="Birim Fiyatı" \
-        --add-combo="Kategori" \
-        --combo-values="Elektronik|Gıda|Kırtasiye|Ev Eşyaları|Giysi" \
-        --width=400)
+        --add-entry="Kategori" \
+        --width=300)
 
-    if [ -z "$form_data" ]; then return 1; fi
-
-    IFS='|' read -r urun_adi stok_miktari birim_fiyat kategori <<< "$form_data"
-
-    # Veri doğrulama
-    if [[ "$urun_adi" =~ [[:space:]] ]]; then
-        zenity --error --text="Ürün adında boşluk olamaz!" --width=300
-        return 1
+    if [ -z "$product_info" ]; then
+        return
     fi
 
-    if ! [[ "$stok_miktari" =~ ^[0-9]+$ ]] || ! [[ "$birim_fiyat" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]]; then
-        zenity --error --text="Geçersiz stok miktarı veya birim fiyat!" --width=300
-        return 1
+    local name=$(echo "$product_info" | cut -d'|' -f1)
+    local stock=$(echo "$product_info" | cut -d'|' -f2)
+    local price=$(echo "$product_info" | cut -d'|' -f3)
+    local category=$(echo "$product_info" | cut -d'|' -f4)
+
+    # Boşluk kontrolü
+    if [[ "$name" =~ [[:space:]] ]] || [[ "$category" =~ [[:space:]] ]]; then
+        zenity --error --text="Ürün adı ve kategori boşluk içeremez!" --width=300
+        log_error "2001" "Ürün adı veya kategori boşluk içeriyor" "$CURRENT_USER" "$name"
+        return
     fi
 
-    # Ürün kontrolü
-    if grep -q ",[^,]*$urun_adi," "$DEPO_CSV"; then
+    # Sayısal değer kontrolü
+    if ! [[ "$stock" =~ ^[0-9]+$ ]] || ! [[ "$price" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        zenity --error --text="Stok miktarı ve fiyat pozitif sayı olmalıdır!" --width=300
+        log_error "2002" "Geçersiz stok veya fiyat değeri" "$CURRENT_USER" "$name"
+        return
+    fi
+
+    # Ürün adı kontrolü
+    if grep -q "^[^,]*,$name," depo.csv 2>/dev/null; then
         zenity --error \
             --text="Bu ürün adıyla başka bir kayıt bulunmaktadır. Lütfen farklı bir ad giriniz." \
             --width=300
-        return 1
+        log_error "2003" "Aynı isimde ürün mevcut" "$CURRENT_USER" "$name"
+        return
     fi
 
-    local urun_no
-    urun_no=$(tail -n1 "$DEPO_CSV" 2>/dev/null | awk -F',' '{print $1+1}' || echo 1)
+    local id=$(get_new_product_id)
+    echo "$id,$name,$stock,$price,$category" >> depo.csv
 
     show_progress "Ürün ekleniyor..."
-
-    echo "$urun_no,$urun_adi,$stok_miktari,$birim_fiyat,$kategori" >> "$DEPO_CSV"
-
-    zenity --info \
-        --text="Ürün başarıyla eklendi!" \
-        --width=300
+    zenity --info --text="Ürün başarıyla eklendi." --width=300
 }
 
+# Ürünleri listeleme
+list_products() {
+    if [ ! -s depo.csv ]; then
+        zenity --info --text="Henüz ürün bulunmamaktadır." --width=300
+        return
+    fi
 
-    
+    local header="No\tÜrün Adı\tStok\tFiyat\tKategori"
+    local content=$(awk -F',' 'BEGIN {OFS="\t"} {print $1, $2, $3, $4, $5}' depo.csv)
 
-# Ürün listeleme
-urun_listele() {
-    local temp_file=$(mktemp)
-    echo -e "Ürün No\tÜrün Adı\tStok\tFiyat\tKategori" > "$temp_file"
-    tail -n +2 "$DEPO_CSV" | sed 's/,/\t/g' >> "$temp_file"
-
-    zenity --text-info \
+    echo -e "$header\n$content" | \
+        zenity --text-info \
         --title="Ürün Listesi" \
-        --filename="$temp_file" \
-        --width=600 --height=400
-
-    rm "$temp_file"
+        --width=700 --height=500
 }
 
 # Ürün güncelleme
-urun_guncelle() {
-    if ! yetki_kontrol; then return 1; fi
+update_product() {
+    # Önce tüm ürünleri listeleyelim ve seçim yaptıralım
+    if [ ! -s depo.csv ]; then
+        zenity --error --text="Güncellenecek ürün bulunmamaktadır." --width=300
+        return
+    fi
 
-    local urun_adi
-    urun_adi=$(zenity --entry \
+    local product_list=$(awk -F',' '{print $2}' depo.csv)
+    local product_name=$(echo "$product_list" | zenity --list \
         --title="Ürün Güncelle" \
-        --text="Güncellenecek ürünün adını girin:" \
+        --text="Güncellenecek ürünü seçiniz:" \
+        --column="Ürün Adı" \
+        --width=300 --height=400)
+
+    if [ -z "$product_name" ]; then
+        return
+    fi
+
+    local product_line=$(grep "^.*,${product_name}," depo.csv)
+    local product_id=$(echo "$product_line" | cut -d',' -f1)
+    local current_stock=$(echo "$product_line" | cut -d',' -f3)
+    local current_price=$(echo "$product_line" | cut -d',' -f4)
+    local current_category=$(echo "$product_line" | cut -d',' -f5)
+
+    local update_info=$(zenity --forms --title="Ürün Güncelle" \
+        --text="Yeni Değerleri Giriniz (Boş bırakmak için bırakınız)" \
+        --add-entry="Yeni Stok Miktarı [$current_stock]" \
+        --add-entry="Yeni Birim Fiyatı [$current_price]" \
+        --add-entry="Yeni Kategori [$current_category]" \
         --width=300)
 
-    if [ -z "$urun_adi" ]; then return 1; fi
-
-    local urun_satiri
-    urun_satiri=$(grep ",[^,]*$urun_adi," "$DEPO_CSV")
-
-    if [ -z "$urun_satiri" ]; then
-        zenity --error --text="Ürün bulunamadı!" --width=300
-        return 1
+    if [ -z "$update_info" ]; then
+        return
     fi
 
-    IFS=',' read -r id old_ad old_stok old_fiyat old_kategori <<< "$urun_satiri"
+    local new_stock=$(echo "$update_info" | cut -d'|' -f1)
+    local new_price=$(echo "$update_info" | cut -d'|' -f2)
+    local new_category=$(echo "$update_info" | cut -d'|' -f3)
 
-    local form_data
-    form_data=$(zenity --forms \
-        --title="Ürün Güncelle" \
-        --text="Yeni bilgileri girin:" \
-        --add-entry="Stok Miktarı [$old_stok]" \
-        --add-entry="Birim Fiyat [$old_fiyat]" \
-        --add-combo="Kategori [$old_kategori]" \
-        --combo-values="Elektronik|Gıda|Kırtasiye|Ev Eşyaları|Giysi" \
-        --width=400)
+    # Boş bırakılan değerleri mevcut değerlerle değiştir
+    new_stock=${new_stock:-$current_stock}
+    new_price=${new_price:-$current_price}
+    new_category=${new_category:-$current_category}
 
-    if [ -z "$form_data" ]; then return 1; fi
-
-    IFS='|' read -r yeni_stok yeni_fiyat yeni_kategori <<< "$form_data"
-
-    # Veri doğrulama
-    if ! [[ "$yeni_stok" =~ ^[0-9]+$ ]] || ! [[ "$yeni_fiyat" =~ ^[0-9]+(\.[0-9]{1,2})?$ ]]; then
-        zenity --error --text="Geçersiz stok miktarı veya birim fiyat!" --width=300
-        return 1
+    # Sayısal değer kontrolü
+    if ! [[ "$new_stock" =~ ^[0-9]+$ ]] || ! [[ "$new_price" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        zenity --error --text="Stok miktarı ve fiyat pozitif sayı olmalıdır!" --width=300
+        log_error "2005" "Geçersiz güncelleme değerleri" "$CURRENT_USER" "$product_name"
+        return
     fi
+
+    # Boşluk kontrolü
+    if [[ "$new_category" =~ [[:space:]] ]]; then
+        zenity --error --text="Kategori boşluk içeremez!" --width=300
+        log_error "2006" "Kategori boşluk içeriyor" "$CURRENT_USER" "$product_name"
+        return
+    fi
+
+    # Ürün satırını güncelle
+    sed -i "/^$product_id,${product_name},/c\\$product_id,$product_name,$new_stock,$new_price,$new_category" depo.csv
 
     show_progress "Ürün güncelleniyor..."
-
-    sed -i "s/^$id,$old_ad,$old_stok,$old_fiyat,$old_kategori/$id,$old_ad,$yeni_stok,$yeni_fiyat,$yeni_kategori/" "$DEPO_CSV"
-
-    zenity --info \
-        --text="Ürün başarıyla güncellendi!" \
-        --width=300
+    zenity --info --text="Ürün başarıyla güncellendi." --width=300
 }
 
 # Ürün silme
-urun_sil() {
-    if ! yetki_kontrol; then return 1; fi
+delete_product() {
+    # Önce tüm ürünleri listeleyelim ve seçim yaptıralım
+    if [ ! -s depo.csv ]; then
+        zenity --error --text="Silinecek ürün bulunmamaktadır." --width=300
+        return
+    fi
 
-    local urun_adi
-    urun_adi=$(zenity --entry \
+    local product_list=$(awk -F',' '{print $2}' depo.csv)
+    local product_name=$(echo "$product_list" | zenity --list \
         --title="Ürün Sil" \
-        --text="Silinecek ürünün adını girin:" \
-        --width=300)
+        --text="Silinecek ürünü seçiniz:" \
+        --column="Ürün Adı" \
+        --width=300 --height=400)
 
-    if [ -z "$urun_adi" ]; then return 1; fi
-
-    if ! grep -q ",[^,]*$urun_adi," "$DEPO_CSV"; then
-        zenity --error --text="Ürün bulunamadı!" --width=300
-        return 1
+    if [ -z "$product_name" ]; then
+        return
     fi
 
     if ! zenity --question \
-        --text="$urun_adi ürününü silmek istediğinizden emin misiniz?" \
+        --text="'$product_name' ürününü silmek istediğinize emin misiniz?" \
         --width=300; then
-        return 1
+        return
     fi
 
+    local product_id=$(grep "^.*,${product_name}," depo.csv | cut -d',' -f1)
+    sed -i "/^$product_id,${product_name},/d" depo.csv
+
     show_progress "Ürün siliniyor..."
-
-    sed -i "/,[^,]*$urun_adi,/d" "$DEPO_CSV"
-
-    zenity --info \
-        --text="Ürün başarıyla silindi!" \
-        --width=300
+    zenity --info --text="Ürün başarıyla silindi." --width=300
 }
 
-# Rapor alma
-rapor_menu() {
-    local secim
-    secim=$(zenity --list \
-        --title="Rapor Al" \
-        --text="Rapor türünü seçin:" \
-        --column="Rapor Türü" \
-        "Stokta Azalan Ürünler" \
-            "En Yüksek Stok Miktarına Sahip Ürünler" \
-    --width=400 --height=300)
-
-    case "$secim" in
-        "Stokta Azalan Ürünler")
-            stokta_azalan_urunler
-            ;;
-        "En Yüksek Stok Miktarına Sahip Ürünler")
-            yuksek_stok_urunler
-            ;;
-        *)
-            zenity --error --text="Geçersiz seçim!" --width=300
-            ;;
-    esac
+# Yeni kullanıcı numarası oluşturma
+get_new_user_id() {
+    if [ ! -s kullanici.csv ]; then
+        echo "1"
+        return
+    fi
+    local last_id=$(tail -n 1 kullanici.csv | cut -d',' -f1)
+    echo $((last_id + 1))
 }
 
-stokta_azalan_urunler() {
-    local temp_file=$(mktemp)
-    echo -e "Ürün No\tÜrün Adı\tStok\tKategori" > "$temp_file"
-    awk -F',' -v stok_esik=$STOK_ESIK 'NR > 1 && $3 < stok_esik { print $1 "\t" $2 "\t" $3 "\t" $5 }' "$DEPO_CSV" >> "$temp_file"
+# Kullanıcı ekleme
+add_user() {
+    local user_info
+    user_info=$(zenity --forms --title="Kullanıcı Ekle" \
+        --text="Kullanıcı Bilgileri" \
+        --add-entry="Ad" \
+        --add-entry="Soyad" \
+        --add-entry="Kullanıcı Adı" \
+        --add-password="Parola" \
+        --add-list="Rol" \
+        --column="Rol" "kullanici" "yonetici" \
+        --width=300)
 
-    zenity --text-info \
+    if [ -z "$user_info" ]; then
+        return
+    fi
+
+    local name=$(echo "$user_info" | cut -d'|' -f1)
+    local surname=$(echo "$user_info" | cut -d'|' -f2)
+    local username=$(echo "$user_info" | cut -d'|' -f3)
+    local password=$(echo "$user_info" | cut -d'|' -f4)
+    local role=$(echo "$user_info" | cut -d'|' -f5)
+
+    # Kullanıcı adı kontrolü
+    if grep -q "^$username," kullanici.csv; then
+        zenity --error --text="Bu kullanıcı adı zaten kullanımda!" --width=300
+        log_error "3001" "Kullanıcı adı mevcut" "$CURRENT_USER" "$username"
+        return
+    fi
+
+    local id=$(get_new_user_id)
+    local md5pass=$(echo -n "$password" | md5sum | cut -d' ' -f1)
+
+    echo "$username,$name $surname,$role,$md5pass,0,0" >> kullanici.csv
+
+    show_progress "Kullanıcı ekleniyor..."
+    zenity --info --text="Kullanıcı başarıyla eklendi." --width=300
+}
+
+# Kullanıcıları listeleme
+list_users() {
+    if [ ! -s kullanici.csv ]; then
+        zenity --info --text="Henüz kullanıcı bulunmamaktadır." --width=300
+        return
+    fi
+
+    local header="Kullanıcı Adı\tAd Soyad\tRol\tKilitli Mi"
+    local content=$(awk -F',' 'BEGIN {OFS="\t"} {locked = ($6 == 1) ? "Evet" : "Hayır"; print $1, $2, $3, locked}' kullanici.csv)
+
+    echo -e "$header\n$content" | \
+        zenity --text-info \
+        --title="Kullanıcı Listesi" \
+        --width=700 --height=500
+}
+
+# Kullanıcı güncelleme
+update_user() {
+    local username=$(zenity --entry \
+        --title="Kullanıcı Güncelle" \
+        --text="Güncellenecek kullanıcının adını giriniz:" \
+        --width=300)
+
+    if [ -z "$username" ]; then
+        return
+    fi
+
+    if [ "$username" == "admin" ]; then
+        zenity --error --text="Admin kullanıcısı güncellenemez!" --width=300
+        return
+    fi
+
+    local user_line=$(grep "^$username," kullanici.csv)
+
+    if [ -z "$user_line" ]; then
+        zenity --error --text="Kullanıcı bulunamadı!" --width=300
+        log_error "3002" "Güncellenecek kullanıcı bulunamadı" "$CURRENT_USER" "$username"
+        return
+    fi
+
+    local update_info=$(zenity --forms --title="Kullanıcı Güncelle" \
+        --text="Yeni Bilgileri Giriniz (Boş bırakmak için bırakınız)" \
+        --add-entry="Yeni Ad" \
+        --add-entry="Yeni Soyad" \
+        --add-password="Yeni Parola (boş bırakılabilir)" \
+        --add-list="Yeni Rol" \
+        --column="Rol" "kullanici" "yonetici" \
+        --width=300)
+
+    if [ -z "$update_info" ]; then
+        return
+    fi
+
+    local new_name=$(echo "$update_info" | cut -d'|' -f1)
+    local new_surname=$(echo "$update_info" | cut -d'|' -f2)
+    local new_password=$(echo "$update_info" | cut -d'|' -f3)
+    local new_role=$(echo "$update_info" | cut -d'|' -f4)
+
+    # Boş bırakılan değerleri mevcut değerlerle değiştir
+    new_name=${new_name:-$(echo "$user_line" | cut -d',' -f2 | awk '{print $1}')}
+    new_surname=${new_surname:-$(echo "$user_line" | cut -d',' -f2 | awk '{print $2}')}
+    new_role=${new_role:-$(echo "$user_line" | cut -d',' -f3)}
+    local md5pass=$(echo -n "$new_password" | md5sum | cut -d' ' -f1)
+    if [ -z "$new_password" ]; then
+        md5pass=$(echo "$user_line" | cut -d',' -f5)
+    fi
+
+    # Kullanıcı satırını güncelle
+    sed -i "/^$username,/c\\$username,$new_name $new_surname,$new_role,$md5pass,$(echo "$user_line" | cut -d',' -f6),$(echo "$user_line" | cut -d',' -f7)" kullanici.csv
+
+    show_progress "Kullanıcı güncelleniyor..."
+    zenity --info --text="Kullanıcı başarıyla güncellendi." --width=300
+}
+
+# Kullanıcı silme
+delete_user() {
+    local username=$(zenity --entry \
+        --title="Kullanıcı Sil" \
+        --text="Silinecek kullanıcının adını giriniz:" \
+        --width=300)
+
+    if [ -z "$username" ]; then
+        return
+    fi
+
+    if [ "$username" == "admin" ]; then
+        zenity --error --text="Admin kullanıcısı silinemez!" --width=300
+        return
+    fi
+
+    if ! grep -q "^$username," kullanici.csv; then
+        zenity --error --text="Kullanıcı bulunamadı!" --width=300
+        log_error "3003" "Silinecek kullanıcı bulunamadı" "$CURRENT_USER" "$username"
+        return
+    fi
+
+    if ! zenity --question \
+        --text="'$username' kullanıcısını silmek istediğinize emin misiniz?" \
+        --width=300; then
+        return
+    fi
+
+    sed -i "/^$username,/d" kullanici.csv
+
+    show_progress "Kullanıcı siliniyor..."
+    zenity --info --text="Kullanıcı başarıyla silindi." --width=300
+}
+
+# Rapor Alma - Stokta Azalan Ürünler
+report_low_stock() {
+    local threshold=$(zenity --entry \
         --title="Stokta Azalan Ürünler" \
-        --filename="$temp_file" \
-        --width=600 --height=400
+        --text="Eşik değeri giriniz:" \
+        --width=300)
 
-    rm "$temp_file"
+    if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
+        zenity --error --text="Eşik değeri pozitif bir sayı olmalıdır!" --width=300
+        log_error "4001" "Geçersiz eşik değeri raporlama" "$CURRENT_USER" "-"
+        return
+    fi
+
+    local low_stock=$(awk -F',' -v thresh="$threshold" '$3 < thresh {print $1"\t"$2"\t"$3"\t"$4"\t"$5}' depo.csv)
+
+    if [ -z "$low_stock" ]; then
+        zenity --info --text="Belirtilen eşik değerinin altında stokta ürün bulunmamaktadır." --width=300
+        return
+    fi
+
+    local header="No\tÜrün Adı\tStok\tFiyat\tKategori"
+    echo -e "$header\n$low_stock" | \
+        zenity --text-info \
+        --title="Stokta Azalan Ürünler" \
+        --width=700 --height=500
 }
 
-yuksek_stok_urunler() {
-    local temp_file=$(mktemp)
-    echo -e "Ürün No\tÜrün Adı\tStok\tKategori" > "$temp_file"
-    awk -F',' -v yuksek_stok_esik=$YUKSEK_STOK_ESIK 'NR > 1 && $3 > yuksek_stok_esik { print $1 "\t" $2 "\t" $3 "\t" $5 }' "$DEPO_CSV" >> "$temp_file"
-
-    zenity --text-info \
+# Rapor Alma - En Yüksek Stok Miktarına Sahip Ürünler
+report_high_stock() {
+    local threshold=$(zenity --entry \
         --title="En Yüksek Stok Miktarına Sahip Ürünler" \
-        --filename="$temp_file" \
-        --width=600 --height=400
+        --text="Eşik değeri giriniz:" \
+        --width=300)
 
-    rm "$temp_file"
+    if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
+        zenity --error --text="Eşik değeri pozitif bir sayı olmalıdır!" --width=300
+        log_error "4002" "Geçersiz eşik değeri raporlama" "$CURRENT_USER" "-"
+        return
+    fi
+
+    local high_stock=$(awk -F',' -v thresh="$threshold" '$3 >= thresh {print $1"\t"$2"\t"$3"\t"$4"\t"$5}' depo.csv)
+
+    if [ -z "$high_stock" ]; then
+        zenity --info --text="Belirtilen eşik değerinin üzerinde stokta ürün bulunmamaktadır." --width=300
+        return
+    fi
+
+    local header="No\tÜrün Adı\tStok\tFiyat\tKategori"
+    echo -e "$header\n$high_stock" | \
+        zenity --text-info \
+        --title="En Yüksek Stok Miktarına Sahip Ürünler" \
+        --width=700 --height=500
 }
 
-# Main function to start the menu
-main_menu() {
+# Rapor Alma Menüsü
+report_menu() {
     while true; do
-        local secim
-        secim=$(zenity --list \
-            --title="Ana Menü" \
-            --text="Bir işlem seçin:" \
+        local choice=$(zenity --list \
+            --title="Rapor Alma" \
             --column="İşlemler" \
-            "Ürün Ekle" \
-            "Ürün Listele" \
-            "Ürün Güncelle" \
-            "Ürün Sil" \
-            "Rapor Al" \
-            "Çıkış" \
+            "Stokta Azalan Ürünler" \
+            "En Yüksek Stok Miktarına Sahip Ürünler" \
+            "Geri" \
             --width=400 --height=300)
 
-        case "$secim" in
-            "Ürün Ekle")
-                urun_ekle
+        case $choice in
+            "Stokta Azalan Ürünler")
+                report_low_stock
                 ;;
-            "Ürün Listele")
-                urun_listele
+            "En Yüksek Stok Miktarına Sahip Ürünler")
+                report_high_stock
                 ;;
-            "Ürün Güncelle")
-                urun_guncelle
-                ;;
-            "Ürün Sil")
-                urun_sil
-                ;;
-            "Rapor Al")
-                rapor_menu
-                ;;
-            "Çıkış")
+            "Geri"|"")
                 break
-                ;;
-            *)
-                zenity --error --text="Geçersiz seçim!" --width=300
                 ;;
         esac
     done
 }
 
-# Program starts here
-dosya_kontrol
-giris_kontrol
-main_menu
+# Program Yönetimi - Diskteki Alanı Göster
+show_disk_space() {
+    local disk_usage=$(df -h . | awk 'NR==2 {print "Toplam Alan: "$2"\nKullanılan: "$3"\nBoş Alan: "$4}')
+    echo -e "$disk_usage" | zenity --text-info --title="Disk Alanı Bilgisi" --width=400 --height=300
+}
 
+# Program Yönetimi - Diske Yedekle
+backup_files() {
+    local backup_dir=$(zenity --file-selection --directory --title="Yedekleme Klasörünü Seçiniz" --width=300)
+    if [ -z "$backup_dir" ]; then
+        return
+    fi
 
+    show_progress "Yedekleme yapılıyor..."
+    cp depo.csv "$backup_dir"/depo_backup.csv
+    cp kullanici.csv "$backup_dir"/kullanici_backup.csv
 
+    zenity --info --text="Yedekleme başarılı!" --width=300
+}
+
+# Program Yönetimi - Hata Kayıtlarını Görüntüleme
+view_error_logs() {
+    if [ ! -s log.csv ]; then
+        zenity --info --text="Henüz hata kaydı bulunmamaktadır." --width=300
+        return
+    fi
+
+    local header="Tarih\tHata Kodu\tKullanıcı\tHata Mesajı\tİlgili Ürün"
+    local content=$(awk -F',' 'BEGIN {OFS="\t"} {print $1, $2, $3, $4, $5}' log.csv)
+
+    echo -e "$header\n$content" | \
+        zenity --text-info \
+        --title="Hata Kayıtları" \
+        --width=800 --height=500
+}
+
+# Program Yönetimi Menüsü
+program_management_menu() {
+    while true; do
+        local choice=$(zenity --list \
+            --title="Program Yönetimi" \
+            --column="İşlemler" \
+            "Disk Alanını Göster" \
+            "Diske Yedekle" \
+            "Hata Kayıtlarını Görüntüle" \
+            "Geri" \
+            --width=400 --height=300)
+
+        case $choice in
+            "Disk Alanını Göster")
+                show_disk_space
+                ;;
+            "Diske Yedekle")
+                backup_files
+                ;;
+            "Hata Kayıtlarını Görüntüle")
+                view_error_logs
+                ;;
+            "Geri"|"")
+                break
+                ;;
+        esac
+    done
+}
+
+# Rapor ve Program Yönetimi Fonksiyonlarını Ana Menüye Ekleme
+admin_menu() {
+    while true; do
+        local choice=$(zenity --list \
+            --title="Yönetici Menüsü" \
+            --column="İşlemler" \
+            "Ürün Ekle" \
+            "Ürünleri Listele" \
+            "Ürün Güncelle" \
+            "Ürün Sil" \
+            "Rapor Al" \
+            "Kullanıcı Ekle" \
+            "Kullanıcıları Listele" \
+            "Kullanıcı Güncelle" \
+            "Kullanıcı Sil" \
+            "Program Yönetimi" \
+            "Hata Kayıtlarını Görüntüle" \
+            "Çıkış" \
+            --width=400 --height=500)
+
+        case $choice in
+            "Ürün Ekle")
+                add_product
+                ;;
+            "Ürünleri Listele")
+                list_products
+                ;;
+            "Ürün Güncelle")
+                update_product
+                ;;
+            "Ürün Sil")
+                delete_product
+                ;;
+            "Rapor Al")
+                report_menu
+                ;;
+            "Kullanıcı Ekle")
+                add_user
+                ;;
+            "Kullanıcıları Listele")
+                list_users
+                ;;
+            "Kullanıcı Güncelle")
+                update_user
+                ;;
+            "Kullanıcı Sil")
+                delete_user
+                ;;
+            "Program Yönetimi")
+                program_management_menu
+                ;;
+            "Hata Kayıtlarını Görüntüle")
+                view_error_logs
+                ;;
+            "Çıkış"|"")
+                if zenity --question --text="Çıkmak istediğinize emin misiniz?" --width=300; then
+                    exit 0
+                fi
+                ;;
+        esac
+    done
+}
+
+# Kullanıcı menüsü (Sadece ürün listeleme ve rapor alma)
+user_menu() {
+    while true; do
+        local choice=$(zenity --list \
+            --title="Kullanıcı Menüsü" \
+            --column="İşlemler" \
+            "Ürünleri Listele" \
+            "Rapor Al" \
+            "Çıkış" \
+            --width=300 --height=300)
+
+        case $choice in
+            "Ürünleri Listele")
+                list_products
+                ;;
+            "Rapor Al")
+                report_menu
+                ;;
+            "Çıkış"|"")
+                if zenity --question --text="Çıkmak istediğinize emin misiniz?" --width=300; then
+                    exit 0
+                fi
+                ;;
+        esac
+    done
+}
+
+# Hesap Kilidini Açma (Yönetici için)
+unlock_user() {
+    local username=$(zenity --entry \
+        --title="Hesap Kilidini Aç" \
+        --text="Kilidi açılacak kullanıcının adını giriniz:" \
+        --width=300)
+
+    if [ -z "$username" ]; then
+        return
+    fi
+
+    if ! grep -q "^$username," kullanici.csv; then
+        zenity --error --text="Kullanıcı bulunamadı!" --width=300
+        log_error "5001" "Hesap kilidi açılmaya çalışılan kullanıcı bulunamadı" "$CURRENT_USER" "$username"
+        return
+    fi
+
+    local user_line=$(grep "^$username," kullanici.csv)
+    local locked=$(echo "$user_line" | cut -d',' -f6)
+
+    if [ "$locked" -eq 0 ]; then
+        zenity --info --text="Bu kullanıcının hesabı zaten açıktır." --width=300
+        return
+    fi
+
+    sed -i "/^$username,/c\\$username,$(echo "$user_line" | cut -d',' -f2),$(echo "$user_line" | cut -d',' -f3),$(echo "$user_line" | cut -d',' -f4),$(echo "$user_line" | cut -d',' -f5),0,0" kullanici.csv
+
+    zenity --info --text="Kullanıcının hesabı başarıyla açıldı." --width=300
+    log_error "5002" "Hesap kilidi açıldı" "$CURRENT_USER" "$username"
+}
+
+# Yönetici menüsüne Hesap Kilidini Aç fonksiyonunu ekleme
+admin_menu() {
+    while true; do
+        local choice=$(zenity --list \
+            --title="Yönetici Menüsü" \
+            --column="İşlemler" \
+            "Ürün Ekle" \
+            "Ürünleri Listele" \
+            "Ürün Güncelle" \
+            "Ürün Sil" \
+            "Rapor Al" \
+            "Kullanıcı Ekle" \
+            "Kullanıcıları Listele" \
+            "Kullanıcı Güncelle" \
+            "Kullanıcı Sil" \
+            "Program Yönetimi" \
+            "Hata Kayıtlarını Görüntüle" \
+            "Hesap Kilidini Aç" \
+            "Çıkış" \
+            --width=400 --height=550)
+
+        case $choice in
+            "Ürün Ekle")
+                add_product
+                ;;
+            "Ürünleri Listele")
+                list_products
+                ;;
+            "Ürün Güncelle")
+                update_product
+                ;;
+            "Ürün Sil")
+                delete_product
+                ;;
+            "Rapor Al")
+                report_menu
+                ;;
+            "Kullanıcı Ekle")
+                add_user
+                ;;
+            "Kullanıcıları Listele")
+                list_users
+                ;;
+            "Kullanıcı Güncelle")
+                update_user
+                ;;
+            "Kullanıcı Sil")
+                delete_user
+                ;;
+            "Program Yönetimi")
+                program_management_menu
+                ;;
+            "Hata Kayıtlarını Görüntüle")
+                view_error_logs
+                ;;
+            "Hesap Kilidini Aç")
+                unlock_user
+                ;;
+            "Çıkış"|"")
+                if zenity --question --text="Çıkmak istediğinize emin misiniz?" --width=300; then
+                    exit 0
+                fi
+                ;;
+        esac
+    done
+}
+
+# Ana program
+main() {
+    check_files
+
+    while true; do
+        if login; then
+            if [ "$USER_ROLE" == "yonetici" ]; then
+                admin_menu
+            else
+                user_menu
+            fi
+        fi
+    done
+}
+
+# Programı başlat
+main
