@@ -220,11 +220,11 @@ Bu proje [MIT Lisansı](./LICENSE) altında lisanslanmıştır. Daha fazla bilgi
 - [Zenity Create GUI Dialog Boxes in Bash Scripts](https://ostechnix.com/zenity-create-gui-dialog-boxes-in-bash-scripts/)
 - [Zenity Examples](https://funprojects.blog/tag/zenity/)
 
-## Video Demo
+## Video 
 
-Kullanımını detaylı olarak gösteren 3-4 dakikalık bir video hazırladım. Aşağıdaki bağlantıdan izleyebilirsiniz:
+Kullanımını detaylı olarak gösteren 6-7 dakikalık bir video hazırladım. Aşağıdaki bağlantıdan izleyebilirsiniz:
 
-[![Video Demo](./screenshots/video_thumbnail.png)](https://www.youtube.com/watch?v=videolink)
+[![Video](./screenshots/video_thumbnail.png)](https://www.youtube.com/watch?v=Btra4bJPIX4)
 
 Video kısa bir süre için geçici bir bağlantıdır. Lütfen videoyu YouTube veya başka bir video platformuna yükleyip, bağlantıyı buraya ekleyin.
 
